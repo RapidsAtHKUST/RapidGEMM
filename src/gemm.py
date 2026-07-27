@@ -173,10 +173,9 @@ def Mgemm(
 def Kgemm_kernel(
     grad,
     X,
-    c_ptr,
+    C_desc,
     cnt_ptr,
     M, N, K,
-    stride_ce, stride_cm, stride_cn,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
@@ -205,16 +204,23 @@ def Kgemm_kernel(
         accumulator += tl.dot(a.T, b)
         offs_k += BLOCK_SIZE_K
         
-    # Always store the accumulator (zeros for empty experts)
-    # TODO: use TMA store can eliminate register usage for c_ptrs. 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    c_ptrs = c_ptr + eid * stride_ce + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
-    tl.store(c_ptrs, accumulator)
+    # Store one 128x128 subtile at a time so the TMA epilogue can reuse a
+    # single 64 KiB shared-memory buffer.
+    if BLOCK_SIZE_M == 256:
+        c = accumulator.reshape(2, 128, BLOCK_SIZE_N).permute(1, 2, 0)
+        c0, c1 = c.split()
+        C_desc.store([eid, offs_m, offs_n], c0.to(C_desc.dtype).reshape(1, 128, 128))
+        C_desc.store([eid, offs_m + 128, offs_n], c1.to(C_desc.dtype).reshape(1, 128, 128))
+    else:
+        c = accumulator.reshape(BLOCK_SIZE_M, 2, 128).permute(0, 2, 1)
+        c0, c1 = c.split()
+        C_desc.store([eid, offs_m, offs_n], c0.to(C_desc.dtype).reshape(1, 128, 128))
+        C_desc.store([eid, offs_m, offs_n + 128], c1.to(C_desc.dtype).reshape(1, 128, 128))
 
-def Kgemm_descriptors(grad, X, block_m, block_n, block_k):
+def Kgemm_descriptors(grad, X, grad_w, block_m, block_n, block_k):
     check_tma_alignment(grad, "grad")
     check_tma_alignment(X, "X")
+    check_tma_alignment(grad_w, "grad_w")
     
     grad_desc = create_ragged_descriptor(
         grad,
@@ -226,7 +232,13 @@ def Kgemm_descriptors(grad, X, block_m, block_n, block_k):
         block_shape=[block_k, block_n],
         ragged_dim=0,   
     )
-    return grad_desc, x_desc
+    c_desc = TensorDescriptor(
+        grad_w,
+        shape=list(grad_w.shape),
+        strides=list(grad_w.stride()),
+        block_shape=[1, 128, 128],
+    )
+    return grad_desc, x_desc, c_desc
 
 def Kgemm(
     grad: torch.Tensor, # [M_total, ]
@@ -258,7 +270,10 @@ def Kgemm(
     }
     assert M % META['BLOCK_SIZE_M'] == 0
     assert N % META['BLOCK_SIZE_N'] == 0
-    grad_desc, x_desc = Kgemm_descriptors(grad, X, META['BLOCK_SIZE_M'], META['BLOCK_SIZE_N'], META['BLOCK_SIZE_K'])
+    grad_desc, x_desc, c_desc = Kgemm_descriptors(
+        grad, X, grad_w,
+        META['BLOCK_SIZE_M'], META['BLOCK_SIZE_N'], META['BLOCK_SIZE_K'],
+    )
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
         E,
@@ -266,12 +281,11 @@ def Kgemm(
     Kgemm_kernel[grid](
         grad_desc,
         x_desc,
-        grad_w,
+        c_desc,
         cnt,
         M,
         N,
         K,
-        grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
         **META,
     )
     return grad_w
